@@ -77,8 +77,8 @@ DWORD CALLBACK StreamInCallback(DWORD_PTR dwCookie, LPBYTE pbBuff, LONG cb, LONG
 
 // ========== 函数声明 ==========
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam);
-void LoadConfig(const char* filename);
-void SaveConfig(const char* filename);
+void LoadConfig();
+void SaveConfig();
 void AddScript(const char* path, BOOL fromConfig);
 void ScanLocalScripts();
 void StartScript(int index);
@@ -138,8 +138,18 @@ void UpdateListDisplay() {
 }
 
 // ========== 配置文件读取保存 ==========
-void LoadConfig(const char* filename) {
-    FILE* f = fopen(filename, "r");
+static void GetIniPath(char* buf, size_t size) {
+    GetModuleFileNameA(NULL, buf, (DWORD)size);
+    char* lastSlash = strrchr(buf, '\\');
+    if (lastSlash) {
+        strcpy(lastSlash + 1, "scripts.ini");
+    }
+}
+
+void LoadConfig() {
+    char iniPath[MAX_PATH];
+    GetIniPath(iniPath, sizeof(iniPath));
+    FILE* f = fopen(iniPath, "r");
     if (!f) return;
 
     char line[MAX_SCRIPT_PATH];
@@ -152,8 +162,10 @@ void LoadConfig(const char* filename) {
     fclose(f);
 }
 
-void SaveConfig(const char* filename) {
-    FILE* f = fopen(filename, "w");
+void SaveConfig() {
+    char iniPath[MAX_PATH];
+    GetIniPath(iniPath, sizeof(iniPath));
+    FILE* f = fopen(iniPath, "w");
     if (!f) return;
 
     // 只保存来自配置文件的脚本
@@ -369,7 +381,7 @@ void AppendToScriptOutput(int index, const char* text) {
     EnterCriticalSection(&script->cs);
 
     int remaining = MAX_OUTPUT_SIZE - script->bufferSize - 1;
-    BOOL bufferCleared = FALSE;  // 标记是否清理了缓冲区
+    BOOL bufferCleared = FALSE;
 
     if (textLen >= remaining) {
         int removeSize = script->bufferSize / BUFFER_CLEAR_RATIO;
@@ -379,16 +391,21 @@ void AppendToScriptOutput(int index, const char* text) {
             script->bufferSize -= removeSize;
             script->outputBuffer[script->bufferSize] = '\0';
 
-            bufferCleared = TRUE;  // 标记已清理
+            // displayedSize 同步减少
+            script->displayedSize -= removeSize;
+            if (script->displayedSize < 0) script->displayedSize = 0;
+
+            bufferCleared = TRUE;
 
             char warning[128];
-            snprintf(warning, sizeof(warning),
+            int warnLen = snprintf(warning, sizeof(warning),
                 "\r\n[警告] 缓冲区已满，已删除 %d 字节旧数据 (保留最新一半)\r\n", removeSize);
-            int warnLen = strlen(warning);
 
             if (script->bufferSize + warnLen < MAX_OUTPUT_SIZE) {
-                strcat(script->outputBuffer, warning);
+                // 直接用 memcpy 在尾部追加，避免 strcat 的 O(n) 扫描
+                memcpy(script->outputBuffer + script->bufferSize, warning, warnLen);
                 script->bufferSize += warnLen;
+                script->outputBuffer[script->bufferSize] = '\0';
             }
         }
 
@@ -403,8 +420,10 @@ void AppendToScriptOutput(int index, const char* text) {
     }
 
     if (script->bufferSize + textLen < MAX_OUTPUT_SIZE) {
-        strncat(script->outputBuffer, text, textLen);
+        // 直接用 memcpy 在已知尾部追加，避免 strncat 的 O(n) 扫描
+        memcpy(script->outputBuffer + script->bufferSize, text, textLen);
         script->bufferSize += textLen;
+        script->outputBuffer[script->bufferSize] = '\0';
     }
 
     script->needUpdate = TRUE;
@@ -426,15 +445,24 @@ void AppendToScriptOutput(int index, const char* text) {
             (script->accumulatedBytes > 4096);
 
         if (shouldUpdate) {
-            // 重新设置整个内容（保证同步）
+            // 保存用户当前的滚动位置状态（在修改 EDIT 之前）
+            BOOL atBottom = TRUE;
+            if (!bufferCleared) {
+                int curTextLen = GetWindowTextLengthA(script->hEdit);
+                DWORD selEnd;
+                SendMessageA(script->hEdit, EM_GETSEL, 0, (LPARAM)&selEnd);
+                atBottom = ((int)selEnd >= curTextLen - 50);
+            }
+
+            // 始终全量刷新，保证 EDIT 内容与缓冲区完全一致
             SetWindowTextA(script->hEdit, script->outputBuffer);
             script->displayedSize = script->bufferSize;
 
             script->lastUpdateTime = now;
             script->accumulatedBytes = 0;
 
-            // 如果是当前显示的脚本，滚动到底部
-            if (index == g_currentTab) {
+            // 智能滚动：只在用户在底部时才自动滚动
+            if (index == g_currentTab && atBottom) {
                 ScrollToBottom(script->hEdit);
             }
         }
@@ -473,6 +501,9 @@ void SwitchToTab(int index) {
         if (g_hEditFont) {
             SendMessage(script->hEdit, WM_SETFONT, (WPARAM)g_hEditFont, TRUE);
         }
+
+        // 确保编辑控件能容纳全部缓冲区内容
+        SendMessage(script->hEdit, EM_LIMITTEXT, MAX_OUTPUT_SIZE - 1, 0);
 
         // 首次填充内容（只执行一次）
         EnterCriticalSection(&script->cs);
@@ -527,6 +558,9 @@ DWORD WINAPI ReadPipeThread(LPVOID lpParam) {
                         AppendToScriptOutput(index, buffer);
                     }
                 }
+
+                // 强制刷新显示：确保所有节流缓存的尾数据被推到 EDIT 控件
+                script->lastUpdateTime = 0;
 
                 char msg[256];
                 snprintf(msg, sizeof(msg), "\r\n[%s] 脚本已自动结束 (退出码: %d)\r\n",
@@ -628,7 +662,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         SendMessage(hBtnDelete, WM_SETFONT, (WPARAM)g_hButtonFont, TRUE);
 
         SetTimer(hwnd, TIMER_UPDATE, UPDATE_INTERVAL, NULL);
-        LoadConfig("scripts.ini");  // 先加载配置文件
+        LoadConfig();  // 先加载配置文件
         ScanLocalScripts();         // 再扫描本地脚本
         UpdateListDisplay();
 
@@ -638,9 +672,34 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
     case WM_TIMER: {
         if (wParam == TIMER_UPDATE) {
-            // 定时器不再需要刷新 EDIT，因为已经实时增量更新了
-            // 只需要更新列表显示（运行状态等）
             UpdateListDisplay();
+
+            // 定时刷出所有脚本被节流缓存的未显示数据
+            for (int i = 0; i < g_scriptCount; i++) {
+                ScriptInfo* s = &g_scripts[i];
+                if (s->bufferSize > s->displayedSize && s->hEdit && IsWindow(s->hEdit)) {
+                    EnterCriticalSection(&s->cs);
+                    if (s->bufferSize > s->displayedSize) {
+                        // SetWindowTextA 会重置滚动位置到顶部，先保存用户是否在底部
+                        BOOL atBottom = FALSE;
+                        if (i == g_currentTab) {
+                            int curTextLen = GetWindowTextLengthA(s->hEdit);
+                            DWORD selEnd;
+                            SendMessageA(s->hEdit, EM_GETSEL, 0, (LPARAM)&selEnd);
+                            atBottom = ((int)selEnd >= curTextLen - 50);
+                        }
+
+                        SetWindowTextA(s->hEdit, s->outputBuffer);
+                        s->displayedSize = s->bufferSize;
+
+                        // 如果在底部则滚回去
+                        if (i == g_currentTab && atBottom) {
+                            ScrollToBottom(s->hEdit);
+                        }
+                    }
+                    LeaveCriticalSection(&s->cs);
+                }
+            }
         }
         break;
     }
@@ -649,9 +708,14 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         int index = (int)wParam;
         if (index == g_currentTab && index >= 0 && index < g_scriptCount) {
             ScriptInfo* script = &g_scripts[index];
-            // 只需要处理滚动
             if (script->needScroll && script->hEdit && IsWindow(script->hEdit)) {
-                ScrollToBottom(script->hEdit);
+                // 只在用户位于底部时才自动滚动
+                int textLen = GetWindowTextLengthA(script->hEdit);
+                DWORD selEnd;
+                SendMessageA(script->hEdit, EM_GETSEL, 0, (LPARAM)&selEnd);
+                if ((int)selEnd >= textLen - 50) {
+                    ScrollToBottom(script->hEdit);
+                }
                 script->needScroll = FALSE;
             }
         }
@@ -730,7 +794,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (GetOpenFileNameA(&ofn)) {
                 AddScript(file, TRUE);  // 手动添加的脚本视为配置脚本
                 UpdateListDisplay();
-                SaveConfig("scripts.ini");
+                SaveConfig();
                 SendMessageA(g_hListBox, LB_SETCURSEL, g_scriptCount - 1, 0);
                 SwitchToTab(g_scriptCount - 1);
             }
@@ -754,7 +818,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 g_scriptCount--;
 
                 UpdateListDisplay();
-                SaveConfig("scripts.ini");
+                SaveConfig();
 
                 if (g_scriptCount == 0) {
                     if (g_currentEdit && IsWindow(g_currentEdit)) {
